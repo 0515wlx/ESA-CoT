@@ -18,21 +18,7 @@ class TestESAModel(unittest.TestCase):
             vocab_size=50257
         )
         
-        # Create a simple base model
-        class SimpleBaseModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.lm_head = torch.nn.Linear(768, 50257)
-                
-            def forward(self, *args, **kwargs):
-                return torch.randn(1, 128, 768)  # Dummy output
-        
-        self.base_model = SimpleBaseModel()
-        
-        self.model = ESAForCausalLM(
-            base_model=self.base_model,
-            config=self.config
-        )
+        self.model = ESAForCausalLM(self.config)
 
     def test_model_initialization(self):
         """Test model initialization"""

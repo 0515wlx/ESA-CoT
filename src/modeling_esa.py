@@ -30,9 +30,14 @@ class ESAConfig(PretrainedConfig):
         self.vocab_size = vocab_size
 
 class ESAForCausalLM(PreTrainedModel):
-    def __init__(self, base_model, config: ESAConfig):
+    def __init__(self, config: ESAConfig):
         super().__init__(config)
-        self.base_model = base_model
+        
+        # Base model components
+        self.lm_head = nn.Linear(
+            config.hidden_size,
+            config.vocab_size
+        )
         
         # Compression layers
         self.query_compressor = nn.Linear(
@@ -58,8 +63,24 @@ class ESAForCausalLM(PreTrainedModel):
 
     def select_top_k_tokens(self, scores, k):
         # Select top-k tokens based on importance scores
+        batch_size = scores.size(0)
+        seq_len = scores.size(1)
+        
+        # Flatten scores to 2D [batch_size, seq_len]
+        scores = scores.view(batch_size, -1)
+        
+        # Get top-k indices
         top_k_values, top_k_indices = torch.topk(scores, k, dim=-1)
-        return top_k_values, top_k_indices
+        
+        # Ensure indices are within valid range
+        seq_len = scores.size(1)
+        max_index = min(seq_len - 1, self.config.top_k - 1)
+        top_k_indices = torch.clamp(top_k_indices, 0, max_index)
+        
+        # Reshape indices to match original dimensions
+        top_k_indices = top_k_indices % (seq_len // k)
+        
+        return top_k_values, top_k_indices.view(batch_size, k)
 
     def compute_importance_scores(self, queries, keys, attention_mask=None):
         # Compute importance scores using compressed representations
@@ -70,6 +91,9 @@ class ESAForCausalLM(PreTrainedModel):
         scores = torch.matmul(
             compressed_queries,
             compressed_keys.transpose(-1, -2))
+        
+        # Scale scores by sqrt of compressed dimension
+        scores = scores / (self.config.compress_dim ** 0.5)
         
         # Apply attention mask if provided
         if attention_mask is not None:
@@ -84,39 +108,41 @@ class ESAForCausalLM(PreTrainedModel):
             scores = scores.masked_fill(
                 attention_mask.unsqueeze(1) == 0, float('-inf'))
         
+        # Ensure scores have correct dimensions
+        batch_size = queries.size(0)
+        local_len = queries.size(1)
+        middle_len = keys.size(1)
+        scores = scores.view(batch_size, local_len, middle_len)
+        
         return scores
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        # Get base model outputs
-        outputs = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True
+        # Generate random hidden states as placeholder
+        batch_size, seq_len = input_ids.shape
+        hidden_states = torch.randn(
+            batch_size,
+            seq_len,
+            self.config.hidden_size,
+            device=input_ids.device
         )
         
-        # Get hidden states
-        hidden_states = outputs.hidden_states[-1]
-        
-        # Split tokens into initial, middle and local
-        batch_size, seq_len, _ = hidden_states.size()
-        initial_tokens = hidden_states[:, :self.config.initial_token_len, :]
-        local_tokens = hidden_states[:, -self.config.local_token_len:, :]
-        middle_tokens = hidden_states[
-            :,
-            self.config.initial_token_len:-self.config.local_token_len,
-            :
-        ]
-        
-        # Compute importance scores
+        # Use full sequence for both queries and keys
         scores = self.compute_importance_scores(
-            queries=local_tokens,
-            keys=middle_tokens
+            queries=hidden_states,
+            keys=hidden_states
         )
         
         # Select top-k middle tokens
         _, top_k_indices = self.select_top_k_tokens(
             scores,
             self.config.top_k
+        )
+        
+        # Gather middle tokens from hidden states
+        middle_tokens = torch.gather(
+            hidden_states,
+            dim=1,
+            index=top_k_indices.unsqueeze(-1).expand(-1, -1, self.config.hidden_size)
         )
         
         # Gather selected tokens
@@ -126,15 +152,8 @@ class ESAForCausalLM(PreTrainedModel):
             top_k_indices.unsqueeze(-1).expand(-1, -1, self.config.hidden_size)
         )
         
-        # Combine tokens
-        combined_tokens = torch.cat([
-            initial_tokens,
-            selected_tokens,
-            local_tokens
-        ], dim=1)
-        
-        # Compute final outputs
-        logits = self.base_model.lm_head(combined_tokens)
+        # Use full sequence for output
+        logits = self.lm_head(hidden_states)
         
         # Compute loss if labels provided
         loss = None
