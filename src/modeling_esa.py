@@ -8,7 +8,6 @@ class ESAConfig(PretrainedConfig):
     def __init__(
         self,
         hidden_size: int = 768,
-        compress_dim: int = 128,
         initial_token_len: int = 128,
         local_token_len: int = 256,
         top_k: int = 64,
@@ -20,7 +19,6 @@ class ESAConfig(PretrainedConfig):
     ):
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
-        self.compress_dim = compress_dim
         self.initial_token_len = initial_token_len
         self.local_token_len = local_token_len
         self.top_k = top_k
@@ -33,23 +31,13 @@ class ESAForCausalLM(PreTrainedModel):
     def __init__(self, config: ESAConfig):
         super().__init__(config)
         
-        # Base model components
+        # 基础模型组件
         self.lm_head = nn.Linear(
             config.hidden_size,
             config.vocab_size
         )
         
-        # Compression layers
-        self.query_compressor = nn.Linear(
-            config.hidden_size,
-            config.compress_dim
-        )
-        self.key_compressor = nn.Linear(
-            config.hidden_size,
-            config.compress_dim
-        )
-        
-        # Initialize weights
+        # 初始化权重
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -62,7 +50,7 @@ class ESAForCausalLM(PreTrainedModel):
                 module.bias.data.zero_()
 
     def select_top_k_tokens(self, scores, k):
-        # Select top-k tokens based on importance scores
+        # 根据重要性分数选择top-k tokens
         batch_size = scores.size(0)
         seq_len = scores.size(1)
         
@@ -83,32 +71,28 @@ class ESAForCausalLM(PreTrainedModel):
         return top_k_values, top_k_indices.view(batch_size, k)
 
     def compute_importance_scores(self, queries, keys, attention_mask=None):
-        # Compute importance scores using compressed representations
-        compressed_queries = self.query_compressor(queries)
-        compressed_keys = self.key_compressor(keys)
-        
-        # Compute dot product attention scores
+        # 计算点积注意力分数
         scores = torch.matmul(
-            compressed_queries,
-            compressed_keys.transpose(-1, -2))
+            queries,
+            keys.transpose(-1, -2))
         
-        # Scale scores by sqrt of compressed dimension
-        scores = scores / (self.config.compress_dim ** 0.5)
+        # 通过隐藏维度的平方根缩放分数
+        scores = scores / (self.config.hidden_size ** 0.5)
         
-        # Apply attention mask if provided
+        # 如果提供了注意力掩码则应用
         if attention_mask is not None:
-            # Create causal mask for local attention
+            # 为局部注意力创建因果掩码
             seq_len = queries.size(1)
             causal_mask = torch.tril(
                 torch.ones(seq_len, seq_len, device=queries.device))
             scores = scores.masked_fill(
                 causal_mask == 0, float('-inf'))
             
-            # Apply input attention mask
+            # 应用输入注意力掩码
             scores = scores.masked_fill(
                 attention_mask.unsqueeze(1) == 0, float('-inf'))
         
-        # Ensure scores have correct dimensions
+        # 确保分数具有正确的维度
         batch_size = queries.size(0)
         local_len = queries.size(1)
         middle_len = keys.size(1)
@@ -117,7 +101,7 @@ class ESAForCausalLM(PreTrainedModel):
         return scores
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        # Generate random hidden states as placeholder
+        # 生成随机隐藏状态作为占位符
         batch_size, seq_len = input_ids.shape
         hidden_states = torch.randn(
             batch_size,
@@ -126,36 +110,36 @@ class ESAForCausalLM(PreTrainedModel):
             device=input_ids.device
         )
         
-        # Use full sequence for both queries and keys
+        # 使用完整序列作为查询和键
         scores = self.compute_importance_scores(
             queries=hidden_states,
             keys=hidden_states
         )
         
-        # Select top-k middle tokens
+        # 选择top-k中间tokens
         _, top_k_indices = self.select_top_k_tokens(
             scores,
             self.config.top_k
         )
         
-        # Gather middle tokens from hidden states
+        # 从隐藏状态中收集中间tokens
         middle_tokens = torch.gather(
             hidden_states,
             dim=1,
             index=top_k_indices.unsqueeze(-1).expand(-1, -1, self.config.hidden_size)
         )
         
-        # Gather selected tokens
+        # 收集选定的tokens
         selected_tokens = torch.gather(
             middle_tokens,
             1,
             top_k_indices.unsqueeze(-1).expand(-1, -1, self.config.hidden_size)
         )
         
-        # Use full sequence for output
+        # 使用完整序列作为输出
         logits = self.lm_head(hidden_states)
         
-        # Compute loss if labels provided
+        # 如果提供了标签则计算损失
         loss = None
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()

@@ -9,7 +9,6 @@ class TestESAModel(unittest.TestCase):
         self.config = ESAConfig(
             hidden_size=768,
             num_heads=12,
-            compress_dim=128,
             initial_token_len=128,
             local_token_len=256,
             top_k=64,
@@ -25,7 +24,6 @@ class TestESAModel(unittest.TestCase):
         self.assertIsNotNone(self.model)
         self.assertEqual(self.model.config.hidden_size, 768)
         self.assertEqual(self.model.config.num_heads, 12)
-        self.assertEqual(self.model.config.compress_dim, 128)
 
     def test_compute_importance_scores(self):
         """Test importance score computation"""
