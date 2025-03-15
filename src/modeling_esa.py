@@ -7,7 +7,7 @@ from typing import Optional
 class ESAConfig(PretrainedConfig):
     def __init__(
         self,
-        hidden_size: int = 768,
+        hidden_size: int = 1536,
         initial_token_len: int = 128,
         local_token_len: int = 256,
         top_k: int = 64,
@@ -100,6 +100,55 @@ class ESAForCausalLM(PreTrainedModel):
         
         return scores
 
+    def select_attention(self, queries, keys):
+        """
+        选择token并计算注意力分数
+        Args:
+            queries: 查询向量 [batch_size, seq_len, hidden_size]
+            keys: 键向量 [batch_size, seq_len, hidden_size]
+        Returns:
+            选择后的token [batch_size, top_k, hidden_size]
+        """
+        # 计算重要性分数
+        scores = self.compute_importance_scores(queries, keys)
+        
+        # 选择top-k tokens
+        _, top_k_indices = self.select_top_k_tokens(scores, self.config.top_k)
+        
+        # 收集选择的tokens
+        select_tokens = torch.gather(
+            queries,
+            dim=1,
+            index=top_k_indices.unsqueeze(-1).expand(-1, -1, self.config.hidden_size)
+        )
+        
+        return select_tokens
+
+    def __init__(self, config: ESAConfig):
+        super().__init__(config)
+        
+        # 基础模型组件
+        self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.position_embeddings = nn.Embedding(config.initial_token_len, config.hidden_size)
+        
+        # Transformer编码器层
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_size,
+            nhead=config.num_heads,
+            dim_feedforward=4*config.hidden_size,
+            dropout=0.1,
+            activation="gelu"
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=6)
+        
+        self.lm_head = nn.Linear(
+            config.hidden_size,
+            config.vocab_size
+        )
+        
+        # 初始化权重
+        self.apply(self._init_weights)
+
     def sliding_window_attention(self, queries, keys, window_size):
         """
         使用滑动窗口计算注意力分数
@@ -114,12 +163,6 @@ class ESAForCausalLM(PreTrainedModel):
         
         # 初始化select_tokens为前k个token
         select_tokens = queries[:, :window_size, :]
-        
-        # 初始化注意力分数矩阵
-        scores = torch.zeros(
-            batch_size, seq_len, seq_len,
-            device=queries.device
-        )
         
         # 从k~2k开始计算
         for i in range(window_size, seq_len, window_size):
@@ -152,50 +195,32 @@ class ESAForCausalLM(PreTrainedModel):
                 dim=1,
                 index=top_k_indices.unsqueeze(-1).expand(-1, -1, self.config.hidden_size)
             )
-            
-            # 将当前窗口的分数更新到总分数矩阵中
-            scores[:, window_start:window_end, window_start:window_end] = window_scores
-            
-        return scores
+        
+        return top_k_indices
 
     def forward(self, input_ids, attention_mask=None, labels=None):
-        # 生成随机隐藏状态作为占位符
         batch_size, seq_len = input_ids.shape
-        hidden_states = torch.randn(
-            batch_size,
-            seq_len,
-            self.config.hidden_size,
-            device=input_ids.device
-        )
         
-        # 使用滑动窗口计算注意力分数
-        scores = self.sliding_window_attention(
+        # 生成输入嵌入
+        input_embeddings = self.embedding(input_ids)
+        
+        # 添加位置编码
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+        position_embeddings = self.position_embeddings(position_ids)
+        
+        hidden_states = input_embeddings + position_embeddings
+        
+        # 通过Transformer编码器
+        hidden_states = self.encoder(hidden_states.transpose(0, 1)).transpose(0, 1)
+        
+        # 选择token并计算注意力
+        hidden_states = self.select_attention(
             queries=hidden_states,
-            keys=hidden_states,
-            window_size=self.config.top_k
+            keys=hidden_states
         )
         
-        # 选择top-k中间tokens
-        _, top_k_indices = self.select_top_k_tokens(
-            scores,
-            self.config.top_k
-        )
-        
-        # 从隐藏状态中收集中间tokens
-        middle_tokens = torch.gather(
-            hidden_states,
-            dim=1,
-            index=top_k_indices.unsqueeze(-1).expand(-1, -1, self.config.hidden_size)
-        )
-        
-        # 收集选定的tokens
-        selected_tokens = torch.gather(
-            middle_tokens,
-            1,
-            top_k_indices.unsqueeze(-1).expand(-1, -1, self.config.hidden_size)
-        )
-        
-        # 使用完整序列作为输出
+        # 计算logits
         logits = self.lm_head(hidden_states)
         
         # 如果提供了标签则计算损失
